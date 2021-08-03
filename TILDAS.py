@@ -531,6 +531,26 @@ class TILDAS_Spectra(list):
     def __init__(self):
         self.logger = logging.getLogger(__name__)
     
+    def merge(self,another_object):
+        ''' 
+        merge with another TILDAS_Spectra object
+        '''
+        if len(self) == 0:
+            self.logger.info('the original object appears empty. returning a copy of new object')
+            self.__dict__.update(another_object.__dict__)
+            for s in another_object:
+                self.append(s)
+            return self
+        if len(another_object) == 0:
+            self.logger.info('the new object appears empty. nothing to add')
+            return self
+        if self.SpectrumLength != another_object.SpectrumLength:
+            self.logger.error('inconsistent spectrum length!')
+        self.logger.info('extending nspec from {} to {}'.format(self.nspec,self.nspec+another_object.nspec))
+        self.nspec += another_object.nspec
+        self.extend(another_object)
+        return self
+    
     def read_spb(self,fn):
         '''
         read and parse spb binary files. see page 56-57 of TDLwintel mannual
@@ -564,7 +584,7 @@ class TILDAS_Spectra(list):
             self.logger.warning('last spectrum not complete?')
         nspec = int(np.floor(nspec))
         self.nspec = nspec
-        self.logger.info('{} spectra to be read'.format(self.nspec))
+        n_bad_spec = 0
         for ispec in range(nspec):
             s = TILDAS_Spectrum()
             s['PathLengthSample'] = self.PathLengthSample
@@ -587,7 +607,13 @@ class TILDAS_Spectra(list):
             idx+=self.nLasersUsed
             s['Spectrum'] = full[idx:idx+self.SpectrumLength]
             idx+=self.SpectrumLength
+            if s['TimeStamp'] == 0:
+                self.logger.warning('seemingly bad spectrum at {}'.format(ispec))
+                n_bad_spec+=1
+                continue
             self.append(s)
+        self.nspec -= n_bad_spec
+        self.logger.info('{} spectra read from {}'.format(self.nspec,fn))
         return self
     
     def sample_gps(self,gps_filename):
@@ -599,9 +625,9 @@ class TILDAS_Spectra(list):
         gps = pd.read_csv(gps_filename,header=None)
         gps_timestamp = gps[5].to_numpy()
         tildas_timestamp = np.array([dt.datetime.timestamp(s['DateTime']) for s in self])
-        f_lat = interp1d(gps_timestamp,gps[2].to_numpy())
-        f_lon = interp1d(gps_timestamp,gps[3].to_numpy())
-        f_v = interp1d(gps_timestamp,gps[4].to_numpy())
+        f_lat = interp1d(gps_timestamp,gps[2].to_numpy(),bounds_error=False)
+        f_lon = interp1d(gps_timestamp,gps[3].to_numpy(),bounds_error=False)
+        f_v = interp1d(gps_timestamp,gps[4].to_numpy(),bounds_error=False)
         for (i,s) in enumerate(self):
             s['Latitude'] = f_lat(tildas_timestamp[i])
             s['Longitude'] = f_lon(tildas_timestamp[i])
@@ -684,4 +710,14 @@ class TILDAS_Spectra(list):
         '''
         return np.array([s[window_name]['fit_result'].best_values[param_name] \
                          for (i,s) in enumerate(self) if i in fitted_indices])
+    
+    def plot_diagnostics(self,plot_fields=['spectral_mean','Speed','PressureSample','TemperatureSample']):
+        '''
+        quick plot of time series
+        '''
+        fig,axs = plt.subplots(len(plot_fields),1,sharex=True,constrained_layout=True)
+        pdt = self.extract_array('DateTime')
+        for (ax,f) in zip(axs,plot_fields):
+            ax.plot(pdt,self.extract_array(f))
+            ax.set_title(f);
 
