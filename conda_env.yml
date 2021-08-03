@@ -1,0 +1,12 @@
+# Install the environment by "conda env create -f conda_env.yml"
+name: arpae
+channels:
+  - defaults
+dependencies:
+  - lmfit
+  - pandas
+  - matplotlib
+  - contextily # if you want to plot basemap
+  - ipython # easier python interface
+  - pyproj # if you want to plot basemap
+prefix: /home/kangsun/anaconda3/envs/arpae # update this to your own conda envs directory
