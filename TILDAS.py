@@ -34,7 +34,8 @@ class HAPI_Molecule():
     it is a generic python class
     '''
     def __init__(self,nickname,mol_id,iso_id,
-                 ref_mixing_ratio=None,IntensityThreshold=0.):
+                 ref_mixing_ratio=None,IntensityThreshold=0.,
+                 profile='Voigt'):
         '''
         nickname:
             however you want to call the molecule/isotopologue. it will be the 
@@ -50,11 +51,14 @@ class HAPI_Molecule():
             absolute value of minimum intensity in cm-1/ (molec x cm-2) to consider.   
             NOTE: default value is 0.   
             NOTE2: Setting this parameter to a value above zero is only recommended for very experienced users. 
+        profile:
+            line shape type. voigt and HT are supported for now
         '''
         self.logger = logging.getLogger(__name__)
         self.nickname = nickname
         self.mol_id = mol_id
         self.iso_id = iso_id
+        self.profile = profile
         if np.isscalar(iso_id):
             self.global_iso_id = ISO[(mol_id,iso_id)][ISO_INDEX['id']]
             self.abundance = ISO[(mol_id,iso_id)][ISO_INDEX['abundance']]
@@ -99,7 +103,7 @@ class HAPI_Molecule():
                 fetch_by_ids(self.nickname,self.global_iso_id,min_wavenumber,max_wavenumber)
         
     def get_optical_depth(self,nu,mixing_ratio,T_K,p_torr,L_cm,
-                          air_density=None,profile='Voigt',H2O_mixing_ratio=0.,
+                          air_density=None,profile=None,H2O_mixing_ratio=0.,
                           return_OD=False):
         '''
         IMPORTANT:H2O_mixing_ratio should be related to DRY AIR, not total air
@@ -112,7 +116,8 @@ class HAPI_Molecule():
         air_density:
             dry air density in SI unit. inferred from T/p if is None
         profile:
-            line shape type. voigt and HT are supported for now
+            line shape type. it becomes redundant after profile is included as
+            an attribute at initiation. can still overwrite here
         H2O_mixing_ratio:
             mixing_ratio of water vapor
         return_OD:
@@ -122,6 +127,8 @@ class HAPI_Molecule():
         if air_density is None:
             # note pressure should be converted to dry air partial pressure
             air_density = p_torr/(1+H2O_mixing_ratio)*global_constants['Pa_per_torr']/T_K/global_constants['kB']*1e-6
+        if profile is None:
+            profile = self.profile
         self.mixing_ratio = mixing_ratio
         self.T_K = T_K
         self.p_torr = p_torr
@@ -308,7 +315,8 @@ class Fitting_Window(dict):
         '''
         if baseline_indices is None:
             baseline_indices = np.hstack((np.arange(0,35),np.arange(150,210),np.arange(270,330)))
-        ybaseline = np.polyval(np.polyfit(self['x'][baseline_indices],self['y'][baseline_indices],3),self['x'])
+        idx = np.isin(self['x'],baseline_indices)
+        ybaseline = np.polyval(np.polyfit(self['x'][idx],self['y'][idx],3),self['x'])
         absorption = (ybaseline-self['y'])/ybaseline
         if line_knowledge_list is None:
             line_knowledge_list = [{'name':'n2o','index range':[50,150],'wavenumber':2242.453110,'absorption range':[0.1,0.25]},#n2o line
@@ -322,7 +330,7 @@ class Fitting_Window(dict):
             if np.nanmax(spec) > lk['absorption range'][1] or np.nanmax(spec) < lk['absorption range'][0]:
                 self.logger.warning(lk['name']+' cannot be found')
             line_wn_list.append(lk['wavenumber'])
-            line_idx_list.append(np.argmax(spec))
+            line_idx_list.append(self['x'][np.argmax(spec)])
         wavcal_poly = np.polyfit(np.array(line_idx_list)-ref_channel,line_wn_list,len(line_wn_list)-1)
         return wavcal_poly
             
@@ -352,22 +360,46 @@ class Fitting_Window(dict):
         m1 = Model(func=forward_model_function,nan_policy='propagate',
                    independent_vars=independent_vars_dict.keys(),
                    param_names=param_names)
-        [m1.set_param_hint(name=n,value=v,vary=ifv) for (n,v,ifv) in zip(param_names,param_prior,param_vary)];
+        # [m1.set_param_hint(name=n,value=v,vary=ifv) for (n,v,ifv) in zip(param_names,param_prior,param_vary)];
+        for (n,v,ifv) in zip(param_names,param_prior,param_vary):
+            if n.lower()[0:3] == 'h2o':#make sure water vapor value does not go crazy
+                m1.set_param_hint(name=n,value=v,vary=ifv,min=0,max=1)
+            else:
+                m1.set_param_hint(name=n,value=v,vary=ifv)
         params = m1.make_params()
         # make sure the channels in independent vars are double
         independent_vars_dict['channels'] = np.float64(self['x'])
         independent_vars_dict['ref_channel'] = np.float64(independent_vars_dict['ref_channel'])
         self['fit_result'] = m1.fit(self['y'],params=params,**independent_vars_dict,max_nfev=max_nfev)
         
-    def plot_fit(self):
+    def plot_fit(self,xsource='nu'):
         ''' 
         quick plot of fit result spectra
+        xsource:
+            choose from 'x' or 'nu'
         '''
         fig,axs = plt.subplots(2,1,figsize=(10,5),sharex=True,constrained_layout=True)
-        axs[0].plot(self['x'],self['y'],'ok')
-        axs[0].plot(self['x'],self['fit_result'].init_fit,'-b')
-        axs[0].plot(self['x'],self['fit_result'].best_fit,'-r')
-        axs[1].plot(self['x'],self['fit_result'].residual,'-ok')
+        if xsource == 'x':
+            xdata = self['x']
+        else:
+            p = np.array([self['fit_result'].best_values['p3_wavenumber'],
+                          self['fit_result'].best_values['p2_wavenumber'],
+                          self['fit_result'].best_values['p1_wavenumber'],
+                          self['fit_result'].best_values['p0_wavenumber']])
+            xdata = np.polyval(p,self['x']-self['ref_channel'])
+        axs[0].plot(xdata,self['y'],'ok')
+        axs[0].plot(xdata,self['fit_result'].init_fit,'-b')
+        axs[0].plot(xdata,self['fit_result'].best_fit,'-r')
+        axs[0].legend(['Data','Prior','Posterior'])
+        axs[0].set_ylabel('Signal [mV]')
+        axs[1].plot(xdata,self['fit_result'].residual,'-ok')
+        axs[1].set_ylabel('Residual [mV]')
+        if xsource == 'x':
+            axs[1].set_xlabel('Channels')
+        else:
+            axs[1].set_xlabel(r'Wavenumber [cm$^{-1}$]')
+        figout = {'fig':fig,'axs':axs}
+        return figout
 
 class TILDAS_Spectrum(dict):
     '''
@@ -416,6 +448,13 @@ class TILDAS_Spectrum(dict):
             paths to hitran files. won't be needed if hapi_molecules_cell/ambient
             are provided
         '''
+        p_torr_cell = self['PressureSample']
+        T_K_cell = self['TemperatureSample']
+        L_cm_cell = self['PathLengthSample']
+        p_torr_ambient = 760
+        T_K_ambient = self['TemperatureSample']
+        L_cm_ambient = 130
+        
         if window_name == 'full_window':
             if hapi_molecules_cell is None:
                 self.logger.info('the HAPI_Molecules object for the cell is not provided. generating internally...')
@@ -424,21 +463,18 @@ class TILDAS_Spectrum(dict):
                 moln_list_cell = [4,2,2,2,1]
                 ison_list_cell = [1,1,2,5,1]
                 minI_list_cell = [1e-21,1e-24,1e-24,1e-24,1e-26]
-                p_torr_cell = self['PressureSample']
-                T_K_cell = self['TemperatureSample']
-                L_cm_cell = self['PathLengthSample']
                 if database_dir_cell is None:
                     self.logger.error('you have to provide location of hitran files!')
                     return
-                hms_cell = HAPI_Molecules()
+                hapi_molecules_cell = HAPI_Molecules()
                 for (mol,moln,ison,minI) in zip(mol_list_cell,moln_list_cell,ison_list_cell,minI_list_cell):
-                    hms_cell.add_molecule(HAPI_Molecule(nickname=mol,mol_id=moln,iso_id=ison,IntensityThreshold=minI))
+                    hapi_molecules_cell.add_molecule(HAPI_Molecule(nickname=mol,mol_id=moln,iso_id=ison,IntensityThreshold=minI))
                 try:
-                    hms_cell.fetch_tables(database_dir_cell,min_wavenumber,max_wavenumber,update_linelists=False)
+                    hapi_molecules_cell.fetch_tables(database_dir_cell,min_wavenumber,max_wavenumber,update_linelists=False)
                 except Exception as e:
                     self.logger.warning(e)
                     self.logger.warning('no hitran files found. try downloading')
-                    hms_cell.fetch_tables(database_dir_cell,min_wavenumber,max_wavenumber,update_linelists=True)
+                    hapi_molecules_cell.fetch_tables(database_dir_cell,min_wavenumber,max_wavenumber,update_linelists=True)
             if hapi_molecules_ambient is None:
                 self.logger.info('the HAPI_Molecules object for the ambient air is not provided. generating internally...')
                 min_wavenumber=2242;max_wavenumber=2243.5
@@ -446,23 +482,20 @@ class TILDAS_Spectrum(dict):
                 moln_list_ambient = [4,2,1]
                 ison_list_ambient = [1,[1,2,5],1]
                 minI_list_ambient = [1e-19,1e-23,1e-25]
-                p_torr_ambient = 760
-                T_K_ambient = self['TemperatureSample']
-                L_cm_ambient = 130
                 if database_dir_ambient is None:
                     self.logger.error('you have to provide location of hitran files!')
                     return
-                hms_ambient = HAPI_Molecules()
+                hapi_molecules_ambient = HAPI_Molecules()
                 for (mol,moln,ison,minI) in zip(mol_list_ambient,moln_list_ambient,ison_list_ambient,minI_list_ambient):
-                    hms_ambient.add_molecule(HAPI_Molecule(nickname=mol,mol_id=moln,iso_id=ison,IntensityThreshold=minI))
+                    hapi_molecules_ambient.add_molecule(HAPI_Molecule(nickname=mol,mol_id=moln,iso_id=ison,IntensityThreshold=minI))
                 try:
-                    hms_ambient.fetch_tables(database_dir_ambient,min_wavenumber,max_wavenumber,update_linelists=False)
+                    hapi_molecules_ambient.fetch_tables(database_dir_ambient,min_wavenumber,max_wavenumber,update_linelists=False)
                 except Exception as e:
                     self.logger.warning(e)
                     self.logger.warning('no hitran files found. try downloading')
-                    hms_ambient.fetch_tables(database_dir_ambient,min_wavenumber,max_wavenumber,update_linelists=True)
+                    hapi_molecules_ambient.fetch_tables(database_dir_ambient,min_wavenumber,max_wavenumber,update_linelists=True)
             
-            spectrum_indices=np.arange(0,400)
+            spectrum_indices=np.arange(10,400)
             zlo_indices=np.arange(470,479)
             ref_channel = 200
             # # those two are reasonable first guesses
@@ -499,18 +532,19 @@ class TILDAS_Spectrum(dict):
             param_vary = np.array([0,1,0,
                                    1,1,1,1,1,
                                    0,0,0,
-                                   0,0,0,
+                                   1,1,1,
                                    1,1,
                                    1,1,
                                    1,1,
                                    1,1],dtype=np.bool)
             independent_vars_dict = {'channels':None,#will fill in Fitting_Window.fit
                                      'ref_channel':ref_channel,
-                                     'hapi_molecules_cell':hms_cell,
-                                     'hapi_molecules_ambient':hms_ambient}
+                                     'hapi_molecules_cell':hapi_molecules_cell,
+                                     'hapi_molecules_ambient':hapi_molecules_ambient}
             self[window_name].fit(F_forward_model_TILDAS_142,
                                   independent_vars_dict,
-                                  param_names,param_prior,param_vary)            
+                                  param_names,param_prior,param_vary)
+            self[window_name]['ref_channel'] = ref_channel
     
     def plot_spectrum(self,ax=None):
         if ax is None:
