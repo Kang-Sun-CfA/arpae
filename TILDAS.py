@@ -583,7 +583,70 @@ class TILDAS_Spectra(list):
         self.logger.info('extending nspec from {} to {}'.format(self.nspec,self.nspec+another_object.nspec))
         self.nspec += another_object.nspec
         self.extend(another_object)
+        if hasattr(self, 'main_df') and hasattr(another_object,'main_df'):
+            self.main_df = pd.concat(self.main_df,another_object.main_df)
         return self
+    
+    def generate_main_df(self,str_file_list=[],stc_file_list=[],
+                         TILDAS_Spectra_fields=['spectral_mean','PressureSample']):
+        ''' 
+        generate the main dataframe by incorporating str and stc files
+        str_file_list:
+            a list of str file names
+        stc_file_list:
+            a list of stc file names
+        TILDAS_Spectra_fields:
+            fields in self to be included in main_df
+        yield a dataframe - main_df as one attribute of the object
+        '''
+        if len(str_file_list) == 0:
+            self.logger.info('no str files')
+            df_str = None
+        else:
+            df_list = []
+            for f in str_file_list:
+                with open(f, "r") as file:
+                    first_line = file.readline()
+                species = first_line.split(':')[-1].strip().split(',')
+                species = ['time']+['{}_{}'.format(s,i) for (i,s) in enumerate(species)]
+                df_list.append(pd.read_csv(f,header=None,
+                                           skiprows=1,
+                                           sep=' ',
+                                           names=species,
+                                           index_col=False,
+                                           skipinitialspace=True))
+            df_str = pd.concat(df_list)
+        if len(stc_file_list) == 0:
+            self.logger.info('no stc files')
+            df_stc = None
+        else:
+            df_list = []
+            for f in stc_file_list:
+                df_list.append(pd.read_csv(f,header=1,skipinitialspace=True))
+            df_stc = pd.concat(df_list)
+            
+        dict_spb = {'time':self.extract_array('TimeStamp')/1e3,
+                    'DateTime':self.extract_array('DateTime')}
+        [dict_spb.__setitem__(k, self.extract_array(k)) for k in TILDAS_Spectra_fields];
+        df_spb = pd.DataFrame(dict_spb)
+        
+        # self.df_str = df_str
+        # self.df_stc = df_stc
+        if df_str is None and df_stc is None:
+            self.main_df = df_spb.set_index('DateTime')
+            return
+        elif df_str is None:
+            df_st = df_stc
+        elif df_stc is None:
+            df_st = df_str
+        else:
+            df_st = df_str.merge(df_stc,on='time')
+        self.main_df = pd.merge_asof(df_spb, 
+                                     df_st,on='time',
+                                     tolerance=1e-2,
+                                     direction='nearest').set_index('DateTime')
+        if self.main_df.shape[0] != self.nspec:
+            self.logger.warning('main_df has {} rows, whereas self has {} spectra'.format(self.main_df.shape[0],self.nspec))
     
     def read_spb(self,fn):
         '''
@@ -704,7 +767,7 @@ class TILDAS_Spectra(list):
         if indices is None:
             indices = np.arange(len(self))
         if extract_field == 'spectral_mean':
-            return np.array([np.nanmean(s['Spectrum'][0:400]-np.nanmean(s['Spectrum'][470:479])) for (i,s) in enumerate(self) if i in indices])
+            return np.array([np.nanmean(s['Spectrum'][10:400]-np.nanmean(s['Spectrum'][470:479])) for (i,s) in enumerate(self) if i in indices])
         else:
             return np.array([s[extract_field] for (i,s) in enumerate(self) if i in indices])
     
