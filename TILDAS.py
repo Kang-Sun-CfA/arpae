@@ -270,6 +270,38 @@ def F_forward_model_TILDAS_142(channels,ref_channel,
                    T_K=T_K_ambient,p_torr=p_torr_ambient,L_cm=L_cm_ambient,return_ODs=True),axis=0)
     return baseline*np.exp(-OD_cell-OD_ambient)
 
+def F_forward_model_frequency(channels,ref_channel,frequency,
+                    T_K_cell,p_torr_cell,L_cm_cell,
+                    N2O_41_cell,CO2_21_cell,CO2_22_cell,CO2_25_cell,H2O_11_cell,
+                    hapi_molecules_cell,
+                    T_K_ambient,p_torr_ambient,L_cm_ambient,
+                    N2O_ambient,CO2_ambient,H2O_ambient,
+                    hapi_molecules_ambient,
+                    p0_wavenumber,p0_baseline,
+                    p1_wavenumber=0,p1_baseline=0,
+                    p2_wavenumber=0,p2_baseline=0,
+                    p3_wavenumber=0,p3_baseline=0):
+    '''
+    forward model to use "frequency" as base of wavenumber polynomial, instead of channels-ref_channel
+    '''
+    poly_wavenumber = np.array([p3_wavenumber,p2_wavenumber,p1_wavenumber,p0_wavenumber],dtype=np.float64)
+    nu = np.polyval(poly_wavenumber,frequency)
+    poly_baseline = np.array([p3_baseline,p2_baseline,p1_baseline,p0_baseline],dtype=np.float64)
+    baseline = np.polyval(poly_baseline,channels-ref_channel)
+    mixing_ratios_cell = {'N2O_41':np.float64(N2O_41_cell),
+                          'CO2_21':np.float64(CO2_21_cell),
+                          'CO2_22':np.float64(CO2_22_cell),
+                          'CO2_25':np.float64(CO2_25_cell),
+                          'H2O_11':np.float64(H2O_11_cell)}
+    mixing_ratios_ambient = {'N2O':np.float64(N2O_ambient),
+                             'CO2':np.float64(CO2_ambient),
+                             'H2O':np.float64(H2O_ambient)}
+    OD_cell = np.sum(hapi_molecules_cell.get_optical_depths(nu=nu,mixing_ratios=mixing_ratios_cell,
+                   T_K=T_K_cell,p_torr=p_torr_cell,L_cm=L_cm_cell,return_ODs=True),axis=0)
+    OD_ambient = np.sum(hapi_molecules_ambient.get_optical_depths(nu=nu,mixing_ratios=mixing_ratios_ambient,
+                   T_K=T_K_ambient,p_torr=p_torr_ambient,L_cm=L_cm_ambient,return_ODs=True),axis=0)
+    return baseline*np.exp(-OD_cell-OD_ambient)
+
 class Fitting_Window(dict):
     '''
     class for a fitting window in TILDAS spectrum, based on python dictionary
@@ -381,12 +413,15 @@ class Fitting_Window(dict):
         fig,axs = plt.subplots(2,1,figsize=(10,5),sharex=True,constrained_layout=True)
         if xsource == 'x':
             xdata = self['x']
-        else:
-            p = np.array([self['fit_result'].best_values['p3_wavenumber'],
-                          self['fit_result'].best_values['p2_wavenumber'],
-                          self['fit_result'].best_values['p1_wavenumber'],
-                          self['fit_result'].best_values['p0_wavenumber']])
-            xdata = np.polyval(p,self['x']-self['ref_channel'])
+        elif xsource == 'nu':
+            if 'nu' in self.keys():
+                xdata = self['nu']
+            else:
+                p = np.array([self['fit_result'].best_values['p3_wavenumber'],
+                              self['fit_result'].best_values['p2_wavenumber'],
+                              self['fit_result'].best_values['p1_wavenumber'],
+                              self['fit_result'].best_values['p0_wavenumber']])
+                xdata = np.polyval(p,self['x']-self['ref_channel'])
         axs[0].plot(xdata,self['y'],'ok')
         axs[0].plot(xdata,self['fit_result'].init_fit,'-b')
         axs[0].plot(xdata,self['fit_result'].best_fit,'-r')
@@ -394,6 +429,9 @@ class Fitting_Window(dict):
         axs[0].set_ylabel('Signal [mV]')
         axs[1].plot(xdata,self['fit_result'].residual,'-ok')
         axs[1].set_ylabel('Residual [mV]')
+        rmse = np.sqrt(np.nanmean(np.power(self['fit_result'].residual,2)))
+        rmse_r = rmse/self['fit_result'].best_values['p0_baseline']
+        axs[1].legend(['residual rmse: {:.3f}, relative: {:.2%}'.format(rmse,rmse_r)])
         if xsource == 'x':
             axs[1].set_xlabel('Channels')
         else:
@@ -409,6 +447,30 @@ class TILDAS_Spectrum(dict):
         self.logger = logging.getLogger(__name__)
         self.nwindow = 0
     
+    def read_spe(self,fn):
+        '''
+        read spe file into a single spectrum
+        fn:
+            path to the spe file
+        '''
+        with open(fn) as f:
+            Ls = f.readlines()
+        nspec = np.int(Ls[3])
+        spe_df = pd.read_csv(fn,header=3,nrows=nspec,sep='\t',names=['spec','fit','baseline','fitmarker','frequency'])
+        self['Spectrum'] = np.array(spe_df['spec'])
+        self['Frequency'] = np.array(spe_df['frequency'])
+        for (i,l) in enumerate(Ls):
+            if 'property - timestamp' in l:
+                self['TimeStamp'] = np.float(Ls[i+1].strip('\n'))
+                self['DateTime'] = dt.datetime(1904,1,1)+dt.timedelta(seconds=self['TimeStamp']/1e3)
+            elif 'cell pressure' in l:
+                self['PressureSample'] = np.float(Ls[i+1].strip('\n'))
+            elif 'pathlength' in l:
+                self['PathLengthSample'] = np.float(Ls[i+1].strip('\n'))
+            elif 'cell temp' in l:
+                self['TemperatureSample'] = np.float(Ls[i+1].strip('\n'))
+        return self
+                
     def trim_spectrum(self,window_name=None,spectrum_indices=np.arange(0,400),
                       zlo_indices=np.arange(470,479)):
         '''
@@ -428,8 +490,13 @@ class TILDAS_Spectrum(dict):
         if window_name is None:
             window_name = 'window_{}'.format(self.nwindow)
         self[window_name] = Fitting_Window(window_name)
-        self[window_name].__setitem__('y',self['Spectrum'][spectrum_indices]-zlo)
-        self[window_name].__setitem__('x',spectrum_indices)
+        self[window_name].__setitem__('y',np.float64(self['Spectrum'][spectrum_indices]-zlo))
+        self[window_name].__setitem__('x',np.float64(spectrum_indices))
+        if 'Frequency' in self.keys():
+            self[window_name].__setitem__('Frequency',np.float64(self['Frequency'][spectrum_indices]))
+        else:
+            self.logger.info('no Frequency in this spectrum, using presaved one')
+            self[window_name].__setitem__('Frequency',static_data['Frequency'][spectrum_indices])
     
     def fit_spectrum(self,window_name,
                      hapi_molecules_cell=None,
@@ -454,8 +521,91 @@ class TILDAS_Spectrum(dict):
         p_torr_ambient = 760
         T_K_ambient = self['TemperatureSample']
         L_cm_ambient = 130
-        
         if window_name == 'full_window':
+            if hapi_molecules_cell is None:
+                self.logger.info('the HAPI_Molecules object for the cell is not provided. generating internally...')
+                min_wavenumber=2242;max_wavenumber=2243.5
+                mol_list_cell = ['N2O_41','CO2_21','CO2_22','CO2_25','H2O_11']
+                moln_list_cell = [4,2,2,2,1]
+                ison_list_cell = [1,1,2,5,1]
+                minI_list_cell = [1e-21,1e-24,1e-24,1e-24,1e-26]
+                if database_dir_cell is None:
+                    self.logger.error('you have to provide location of hitran files!')
+                    return
+                hapi_molecules_cell = HAPI_Molecules()
+                for (mol,moln,ison,minI) in zip(mol_list_cell,moln_list_cell,ison_list_cell,minI_list_cell):
+                    hapi_molecules_cell.add_molecule(HAPI_Molecule(nickname=mol,mol_id=moln,iso_id=ison,IntensityThreshold=minI))
+                try:
+                    hapi_molecules_cell.fetch_tables(database_dir_cell,min_wavenumber,max_wavenumber,update_linelists=False)
+                except Exception as e:
+                    self.logger.warning(e)
+                    self.logger.warning('no hitran files found. try downloading')
+                    hapi_molecules_cell.fetch_tables(database_dir_cell,min_wavenumber,max_wavenumber,update_linelists=True)
+            if hapi_molecules_ambient is None:
+                self.logger.info('the HAPI_Molecules object for the ambient air is not provided. generating internally...')
+                min_wavenumber=2242;max_wavenumber=2243.5
+                mol_list_ambient = ['N2O','CO2','H2O']
+                moln_list_ambient = [4,2,1]
+                ison_list_ambient = [1,[1,2,5],1]
+                minI_list_ambient = [1e-19,1e-23,1e-25]
+                if database_dir_ambient is None:
+                    self.logger.error('you have to provide location of hitran files!')
+                    return
+                hapi_molecules_ambient = HAPI_Molecules()
+                for (mol,moln,ison,minI) in zip(mol_list_ambient,moln_list_ambient,ison_list_ambient,minI_list_ambient):
+                    hapi_molecules_ambient.add_molecule(HAPI_Molecule(nickname=mol,mol_id=moln,iso_id=ison,IntensityThreshold=minI))
+                try:
+                    hapi_molecules_ambient.fetch_tables(database_dir_ambient,min_wavenumber,max_wavenumber,update_linelists=False)
+                except Exception as e:
+                    self.logger.warning(e)
+                    self.logger.warning('no hitran files found. try downloading')
+                    hapi_molecules_ambient.fetch_tables(database_dir_ambient,min_wavenumber,max_wavenumber,update_linelists=True)
+            
+            spectrum_indices=np.arange(10,400)
+            zlo_indices=np.arange(470,479)
+            ref_channel = 200
+            
+            self.trim_spectrum(window_name,spectrum_indices,zlo_indices)
+            
+            param_names = ['T_K_cell','p_torr_cell','L_cm_cell',
+                           'N2O_41_cell','CO2_21_cell','CO2_22_cell','CO2_25_cell','H2O_11_cell',
+                           'T_K_ambient','p_torr_ambient','L_cm_ambient',
+                           'N2O_ambient','CO2_ambient','H2O_ambient',
+                           'p0_wavenumber','p0_baseline',
+                           'p1_wavenumber','p1_baseline',
+                           'p2_wavenumber','p2_baseline',
+                           'p3_wavenumber','p3_baseline']
+            param_prior = [T_K_cell,p_torr_cell,L_cm_cell,
+                           330e-9,420e-6,420e-6,420e-6,0.01,
+                           T_K_ambient,p_torr_ambient,L_cm_ambient,
+                           330e-9,420e-6,0.01,
+                           2242.27,1000,
+                           1,-1.8,
+                           0,0,
+                           0,0]
+            param_vary = np.array([0,1,0,
+                                   1,1,1,1,1,
+                                   0,0,0,
+                                   1,1,1,
+                                   1,1,
+                                   1,1,
+                                   1,1,
+                                   0,1],dtype=np.bool)
+            independent_vars_dict = {'channels':None,#will fill in Fitting_Window.fit
+                                     'ref_channel':ref_channel,
+                                     'frequency':self[window_name]['Frequency'],
+                                     'hapi_molecules_cell':hapi_molecules_cell,
+                                     'hapi_molecules_ambient':hapi_molecules_ambient}
+            self[window_name].fit(F_forward_model_frequency,
+                                  independent_vars_dict,
+                                  param_names,param_prior,param_vary)
+            self[window_name]['ref_channel'] = ref_channel
+            p = np.array([self[window_name]['fit_result'].best_values['p3_wavenumber'],
+                          self[window_name]['fit_result'].best_values['p2_wavenumber'],
+                          self[window_name]['fit_result'].best_values['p1_wavenumber'],
+                          self[window_name]['fit_result'].best_values['p0_wavenumber']])
+            self[window_name]['nu'] = np.polyval(p,self[window_name]['Frequency'])
+        elif window_name == 'full_window_guess_nu':
             if hapi_molecules_cell is None:
                 self.logger.info('the HAPI_Molecules object for the cell is not provided. generating internally...')
                 min_wavenumber=2242;max_wavenumber=2243.5
@@ -545,6 +695,12 @@ class TILDAS_Spectrum(dict):
                                   independent_vars_dict,
                                   param_names,param_prior,param_vary)
             self[window_name]['ref_channel'] = ref_channel
+            p = np.array([self[window_name]['fit_result'].best_values['p3_wavenumber'],
+                          self[window_name]['fit_result'].best_values['p2_wavenumber'],
+                          self[window_name]['fit_result'].best_values['p1_wavenumber'],
+                          self[window_name]['fit_result'].best_values['p0_wavenumber']])
+            self[window_name]['nu'] = np.polyval(p,self[window_name]['x']-self[window_name]['ref_channel'])
+            
     
     def plot_spectrum(self,ax=None):
         if ax is None:
@@ -817,4 +973,109 @@ class TILDAS_Spectra(list):
         for (ax,f) in zip(axs,plot_fields):
             ax.plot(pdt,self.extract_array(f))
             ax.set_title(f);
-
+# frequency copied from 210729_163418_001_SIG.spe
+static_data = {'Frequency':
+              np.array([0.        , 0.00199959, 0.00399918, 0.00599877, 0.00799836,
+                       0.00999795, 0.01199755, 0.01399713, 0.01599673, 0.01799631,
+                       0.0199959 , 0.0219955 , 0.02399508, 0.02599481, 0.02799461,
+                       0.02999437, 0.03199405, 0.03399362, 0.03599304, 0.0379923 ,
+                       0.03999136, 0.04199018, 0.04398876, 0.04598703, 0.047985  ,
+                       0.04998261, 0.05197985, 0.05397667, 0.05597302, 0.0579689 ,
+                       0.05996423, 0.061959  , 0.06395318, 0.06594671, 0.06793959,
+                       0.06993178, 0.07192327, 0.07391402, 0.07590401, 0.07789319,
+                       0.07988156, 0.08186908, 0.08385571, 0.08584144, 0.08782623,
+                       0.08981005, 0.0917929 , 0.09377477, 0.09575565, 0.09773552,
+                       0.09971436, 0.10169219, 0.10366897, 0.10564471, 0.10761938,
+                       0.109593  , 0.11156555, 0.113537  , 0.11550737, 0.11747667,
+                       0.11944488, 0.121412  , 0.12337804, 0.125343  , 0.12730688,
+                       0.12926968, 0.13123142, 0.13319208, 0.13515169, 0.13711025,
+                       0.13906773, 0.14102414, 0.14297948, 0.14493373, 0.1468869 ,
+                       0.14883896, 0.15078989, 0.15273969, 0.15468834, 0.15663579,
+                       0.15858207, 0.16052713, 0.16247097, 0.16441356, 0.16635489,
+                       0.16829494, 0.1702337 , 0.17217114, 0.17410725, 0.17604201,
+                       0.17797537, 0.17990735, 0.1818379 , 0.18376702, 0.18569466,
+                       0.18762083, 0.1895455 , 0.19146864, 0.19339024, 0.19531029,
+                       0.19722879, 0.19914576, 0.20106121, 0.20297515, 0.20488758,
+                       0.20679854, 0.20870801, 0.21061603, 0.21252261, 0.21442774,
+                       0.21633147, 0.2182338 , 0.22013475, 0.22203433, 0.22393255,
+                       0.22582943, 0.22772498, 0.2296192 , 0.23151213, 0.23340376,
+                       0.23529412, 0.23718323, 0.2390711 , 0.24095777, 0.24284323,
+                       0.24472753, 0.24661065, 0.24849262, 0.25037342, 0.2522531 ,
+                       0.25413165, 0.25600908, 0.2578854 , 0.25976061, 0.2616347 ,
+                       0.26350768, 0.26537953, 0.26725025, 0.26911984, 0.27098831,
+                       0.27285562, 0.2747218 , 0.27658682, 0.27845068, 0.28031338,
+                       0.28217491, 0.28403528, 0.28589448, 0.2877525 , 0.28960936,
+                       0.29146503, 0.29331953, 0.29517287, 0.297025  , 0.29887593,
+                       0.30072566, 0.30257419, 0.3044215 , 0.30626759, 0.30811248,
+                       0.30995614, 0.31179859, 0.31363981, 0.31547983, 0.31731863,
+                       0.3191562 , 0.32099256, 0.3228277 , 0.32466161, 0.32649429,
+                       0.32832573, 0.33015595, 0.33198492, 0.33381265, 0.33563913,
+                       0.33746434, 0.3392883 , 0.34111098, 0.34293238, 0.34475246,
+                       0.34657125, 0.3483887 , 0.35020479, 0.35201954, 0.35383292,
+                       0.35564492, 0.35745553, 0.35926474, 0.36107255, 0.36287894,
+                       0.36468393, 0.36648748, 0.3682896 , 0.37009031, 0.37188958,
+                       0.37368744, 0.37548385, 0.37727882, 0.37907237, 0.38086446,
+                       0.38265511, 0.3844443 , 0.38623203, 0.38801829, 0.3898031 ,
+                       0.39158646, 0.39336839, 0.39514889, 0.39692796, 0.39870565,
+                       0.40048192, 0.40225682, 0.40403033, 0.40580244, 0.40757319,
+                       0.40934256, 0.41111055, 0.41287717, 0.41464243, 0.41640632,
+                       0.41816887, 0.41993009, 0.42168995, 0.42344849, 0.42520572,
+                       0.42696162, 0.42871621, 0.43046949, 0.43222146, 0.43397213,
+                       0.4357215 , 0.43746955, 0.4392163 , 0.44096175, 0.44270588,
+                       0.44444869, 0.44619018, 0.44793035, 0.44966919, 0.4514067 ,
+                       0.4531429 , 0.45487778, 0.45661135, 0.45834361, 0.46007458,
+                       0.46180424, 0.46353261, 0.46525968, 0.46698545, 0.46870992,
+                       0.47043309, 0.47215495, 0.47387551, 0.47559476, 0.4773127 ,
+                       0.47902932, 0.48074461, 0.48245857, 0.48417118, 0.48588246,
+                       0.48759237, 0.48930093, 0.49100813, 0.49271395, 0.49441839,
+                       0.49612144, 0.49782311, 0.49952338, 0.50122225, 0.50291974,
+                       0.50461583, 0.50631053, 0.50800384, 0.50969577, 0.51138629,
+                       0.51307543, 0.51476318, 0.51644955, 0.51813451, 0.5198181 ,
+                       0.5215003 , 0.52318111, 0.52486051, 0.52653852, 0.52821511,
+                       0.52989029, 0.53156404, 0.53323637, 0.53490728, 0.53657677,
+                       0.53824485, 0.53991151, 0.54157678, 0.54324064, 0.54490311,
+                       0.5465642 , 0.54822389, 0.54988222, 0.55153919, 0.5531948 ,
+                       0.55484907, 0.55650201, 0.55815363, 0.55980392, 0.5614529 ,
+                       0.56310056, 0.56474692, 0.56639198, 0.56803573, 0.56967819,
+                       0.57131936, 0.57295924, 0.57459782, 0.57623511, 0.57787111,
+                       0.57950582, 0.58113924, 0.5827714 , 0.58440233, 0.58603206,
+                       0.58766063, 0.58928804, 0.59091433, 0.59253954, 0.59416368,
+                       0.5957868 , 0.59740891, 0.59903005, 0.60065023, 0.60226951,
+                       0.60388791, 0.60550546, 0.60712219, 0.60873819, 0.61035349,
+                       0.61196815, 0.6135822 , 0.6151957 , 0.61680871, 0.61842127,
+                       0.62003344, 0.6216453 , 0.62325691, 0.62486833, 0.62647965,
+                       0.62809092, 0.62970223, 0.63131366, 0.6329253 , 0.63453726,
+                       0.63614961, 0.63776244, 0.63937586, 0.64098995, 0.64260478,
+                       0.64422048, 0.64583712, 0.64745481, 0.64907362, 0.65069365,
+                       0.65231502, 0.65393778, 0.65556204, 0.65718787, 0.65881536,
+                       0.66044461, 0.66207567, 0.66370863, 0.66534359, 0.66698063,
+                       0.6686198 , 0.67026122, 0.67190495, 0.67355105, 0.67519962,
+                       0.67685074, 0.67850446, 0.68016085, 0.68181998, 0.68348189,
+                       0.68514667, 0.68681436, 0.68848504, 0.69015875, 0.69183556,
+                       0.69351548, 0.69519852, 0.69688468, 0.69857398, 0.70026641,
+                       0.70196198, 0.70366064, 0.70536234, 0.70706703, 0.70877466,
+                       0.71048514, 0.71219846, 0.71391452, 0.71563329, 0.71735467,
+                       0.71907855, 0.72080481, 0.72253333, 0.724264  , 0.72599671,
+                       0.7277313 , 0.7294676 , 0.73120544, 0.73294464, 0.73468503,
+                       0.73642646, 0.73816873, 0.73991169, 0.74165519, 0.74339911,
+                       0.74514328, 0.7468875 , 0.74863118, 0.75037486, 0.75211854,
+                       0.75386222, 0.7556059 , 0.75734958, 0.75909326, 0.76083694,
+                       0.76258062, 0.7643243 , 0.76606798, 0.76781166, 0.76955535,
+                       0.77129903, 0.77304271, 0.77478639, 0.77653007, 0.77827375,
+                       0.78001743, 0.78176112, 0.7835048 , 0.78524848, 0.78699216,
+                       0.78873584, 0.79047952, 0.7922232 , 0.79396688, 0.79571057,
+                       0.79745425, 0.79919793, 0.80094161, 0.80268529, 0.80442897,
+                       0.80617265, 0.80791633, 0.80966001, 0.81140369, 0.81314737,
+                       0.81489105, 0.81663473, 0.81837841, 0.8201221 , 0.82186578,
+                       0.82360946, 0.82535314, 0.82709682, 0.8288405 , 0.83058418,
+                       0.83232787, 0.83407155, 0.83581523, 0.83755891, 0.83930259,
+                       0.84104627, 0.84278995, 0.84453364, 0.84627732, 0.848021  ,
+                       0.84976468, 0.85150836, 0.85325204, 0.85499572, 0.8567394 ,
+                       0.8567394 , 0.8577394 , 0.8587394 , 0.8597394 , 0.8607394 ,
+                       0.8617394 , 0.8627394 , 0.8637394 , 0.8647394 , 0.8657394 ,
+                       0.8667394 , 0.8677394 , 0.8687394 , 0.8697394 , 0.8707394 ,
+                       0.8717394 , 0.8727394 , 0.8737394 , 0.8747394 , 0.8757394 ,
+                       0.8767394 , 0.8777394 , 0.8787394 , 0.8797394 , 0.8807394 ,
+                       0.8817394 , 0.8827394 , 0.8837394 , 0.8847394 , 0.8857394 ,
+                       0.8867394 , 0.8877394 , 0.8887394 , 0.8897394 , 0.8907394 ,
+                       0.8917394 , 0.8927394 , 0.8937394 , 0.8947394 , 0.8957394 ],dtype=np.float64)}
