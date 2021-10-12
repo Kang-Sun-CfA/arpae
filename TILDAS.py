@@ -714,6 +714,14 @@ class TILDAS_Spectrum(dict):
         figout['spec'] = ax.plot(self['Spectrum'])
         return figout
 
+# def wrapper_func(args):
+#     s = TILDAS_Spectrum()
+#     s.__dict__.update(args[0].__dict__)
+#     s.update(args[0])
+#     return s.fit_spectrum(window_name=args[1],hapi_molecules_cell=args[2],
+#                          hapi_molecules_ambient=args[3],
+#                          database_dir_cell=args[4],
+#                          database_dir_ambient=args[5])
 class TILDAS_Spectra(list):
     '''
     class of aerodyne TILDAS sensor spectra collection. it is a list of TILDAS_Spectrum object
@@ -743,10 +751,12 @@ class TILDAS_Spectra(list):
             self.main_df = pd.concat(self.main_df,another_object.main_df)
         return self
     
-    def generate_main_df(self,str_file_list=[],stc_file_list=[],
-                         TILDAS_Spectra_fields=['spectral_mean','PressureSample']):
+    def generate_main_df(self,fit_mat_list=None,str_file_list=None,stc_file_list=None,
+                         TILDAS_Spectra_fields=None):
         ''' 
         generate the main dataframe by incorporating str and stc files
+        fit_mat_list:
+            a list of mat files from fitting
         str_file_list:
             a list of str file names
         stc_file_list:
@@ -755,6 +765,25 @@ class TILDAS_Spectra(list):
             fields in self to be included in main_df
         yield a dataframe - main_df as one attribute of the object
         '''
+        from scipy.io import loadmat
+        TILDAS_Spectra_fields = TILDAS_Spectra_fields or ['spectral_mean','PressureSample']
+        fit_mat_list = fit_mat_list or []
+        str_file_list = str_file_list or []
+        stc_file_list = stc_file_list or []
+        if len(fit_mat_list) == 0:
+            self.logger.info('no fit mat files')
+            df_fit = None
+        else:
+            mat_list = [loadmat(f,squeeze_me=True) for f in fit_mat_list]
+            all_mat = {}
+            for k in mat_list[0].keys():
+                if k[0] == '_':
+                    continue
+                all_mat[k] = np.hstack([m[k] for m in mat_list])
+            
+            df_fit = pd.DataFrame(all_mat).sort_values(['TimeStamp'],ascending=True)
+            df_fit['time'] = df_fit['TimeStamp']/1e3
+            df_fit.drop_duplicates(inplace=True)    
         if len(str_file_list) == 0:
             self.logger.info('no str files')
             df_str = None
@@ -785,7 +814,9 @@ class TILDAS_Spectra(list):
                     'DateTime':self.extract_array('DateTime')}
         [dict_spb.__setitem__(k, self.extract_array(k)) for k in TILDAS_Spectra_fields];
         df_spb = pd.DataFrame(dict_spb)
-        
+        if df_fit is not None:
+            df_spb = pd.merge_asof(df_spb,df_fit,on='time',
+                                   tolerance=1e-2,direction='nearest')
         # self.df_str = df_str
         # self.df_stc = df_stc
         if df_str is None and df_stc is None:
@@ -932,7 +963,8 @@ class TILDAS_Spectra(list):
                      hapi_molecules_cell=None,
                      hapi_molecules_ambient=None,
                      database_dir_cell=None,
-                     database_dir_ambient=None):
+                     database_dir_ambient=None,
+                     ncores=0):
         ''' 
         selectively fit a subset of TILDAS_Spectrum objects by time. see
         TILDAS_Spectrum.fit_spectrum
@@ -940,13 +972,17 @@ class TILDAS_Spectra(list):
             start/end datetime between which spectra are fitted
         step:
             step size. 1 to fit every spectrum
+        ncores:
+            0 means serial
         return:
             indices of TILDAS_Spectrum objects that are fitted
         '''
         ss_dt = self.extract_array('DateTime')
         idx = np.where((ss_dt>=start_dt)&(ss_dt<end_dt))[0]
-        fitted_indices = np.arange(idx[0],idx[-1],step)
+        fitted_indices = np.arange(idx[0],idx[-1],step,dtype=np.int)
         # to be parallelized
+#         if ncores == 0:
+        self.logger.info('serial fitting')
         for i in fitted_indices:
             Time = time.time()
             self[i].fit_spectrum(window_name=window_name,
@@ -955,6 +991,14 @@ class TILDAS_Spectra(list):
                                  database_dir_cell=database_dir_cell,
                                  database_dir_ambient=database_dir_ambient)
             self.logger.info('spectrum collected on {} fitted, took {:.3f} s'.format(self[i]['DateTime'].strftime('%Y%m%dT%H%M%S'),time.time()-Time))
+#         else:
+#             import multiprocessing
+#             ncores = np.min([ncores,multiprocessing.cpu_count()])
+#             self.logger.info('parallel fitting on {} cores'.format(ncores))
+#             with multiprocessing.Pool(ncores) as pp:
+#                 pp.map(wrapper_func,
+#                        ((self[i],window_name,hapi_molecules_cell,hapi_molecules_ambient,
+#                         database_dir_cell,database_dir_ambient) for i in fitted_indices))
         return fitted_indices
     
     def get_fitted_result(self,fitted_indices,param_name,window_name='full_window'):
