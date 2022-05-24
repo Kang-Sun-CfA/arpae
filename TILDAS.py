@@ -752,6 +752,7 @@ class TILDAS_Spectra(list):
         return self
     
     def generate_main_df(self,fit_mat_list=None,str_file_list=None,stc_file_list=None,
+                         gps_file_list=None,
                          TILDAS_Spectra_fields=None):
         ''' 
         generate the main dataframe by incorporating str and stc files
@@ -761,6 +762,8 @@ class TILDAS_Spectra(list):
             a list of str file names
         stc_file_list:
             a list of stc file names
+        gps_file_list:
+            a list of gps files
         TILDAS_Spectra_fields:
             fields in self to be included in main_df
         yield a dataframe - main_df as one attribute of the object
@@ -812,6 +815,21 @@ class TILDAS_Spectra(list):
             
         dict_spb = {'time':self.extract_array('TimeStamp')/1e3,
                     'DateTime':self.extract_array('DateTime')}
+        # add gps files
+        if gps_file_list is not None:
+            gps = pd.concat([pd.read_csv(f,header=None) for f in gps_file_list])
+            gps_timestamp = gps[5].to_numpy()
+            tildas_timestamp = np.array([dt.datetime.timestamp(s['DateTime']) for s in self])
+            f_lat = interp1d(gps_timestamp,gps[2].to_numpy(),bounds_error=False)
+            f_lon = interp1d(gps_timestamp,gps[3].to_numpy(),bounds_error=False)
+            f_v = interp1d(gps_timestamp,gps[4].to_numpy(),bounds_error=False)
+            for (i,s) in enumerate(self):
+                s['Latitude'] = f_lat(tildas_timestamp[i])
+                s['Longitude'] = f_lon(tildas_timestamp[i])
+                s['Speed'] = f_v(tildas_timestamp[i])
+                
+            TILDAS_Spectra_fields += ['Latitude','Longitude','Speed']
+                
         [dict_spb.__setitem__(k, self.extract_array(k)) for k in TILDAS_Spectra_fields];
         df_spb = pd.DataFrame(dict_spb)
         if df_fit is not None:
